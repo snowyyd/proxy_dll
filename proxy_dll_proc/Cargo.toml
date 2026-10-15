@@ -1,14 +1,16 @@
 [package]
 name = "proxy_dll_proc"
-version = "0.1.0"
-edition = "2021"
+repository.workspace = true
+authors.workspace = true
+license.workspace = true
+version.workspace = true
+edition.workspace = true
 
 [lib]
 proc-macro = true
 
 [dependencies]
-syn = { version = "2", features = ["extra-traits", "full"] }
-quote = "1.0.37"
-proc-macro2 = "1.0.87"
-msvc_def.workspace = true
-windows-sys = "0.59.0"
+syn = { version = "3.0.9", features = ["extra-traits", "full"] }
+quote = "1.0.47"
+proc-macro2 = "1.0.107"
+windows-sys = "0.61.2"

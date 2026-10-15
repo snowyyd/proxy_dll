@@ -1,0 +1,17 @@
+[package]
+name = "demo_dll"
+repository.workspace = true
+authors.workspace = true
+license.workspace = true
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+windows = { version = "0.62.2", features = [
+	"Win32_Foundation",
+	"Win32_System_SystemServices",
+	"Win32_UI_WindowsAndMessaging",
+] }

@@ -1,29 +1,127 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
-use syn::{parse_macro_input, punctuated::Punctuated, Ident, Token};
+use syn::{parse::Parse, parse_macro_input, punctuated::Punctuated, Ident, LitStr, Token};
 
-/// helper function to strip comments from def files because the msvc_def crate does not handle them
-fn strip_comments(input: &str) -> String {
-    input
-        .lines()
-        .filter(|l| !l.trim_ascii_start().starts_with(";"))
-        .collect::<Vec<&str>>()
-        .join("\n")
+/// Lightweight parser for .def files
+fn parse_def_exports(content: &str) -> Vec<(String, Option<u16>, bool)> {
+    let mut exports = Vec::new();
+    let mut in_exports_section = false;
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with(';') {
+            continue;
+        }
+
+        if line.eq_ignore_ascii_case("EXPORTS") {
+            in_exports_section = true;
+            continue;
+        }
+
+        if in_exports_section {
+            if line.eq_ignore_ascii_case("LIBRARY") || line.starts_with('[') {
+                break;
+            }
+
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if let Some(name_part) = parts.first() {
+                if *name_part == "DllMain" {
+                    continue;
+                }
+
+                let mut ordinal = None;
+                let mut noname = false;
+
+                for part in parts.iter().skip(1) {
+                    if part.starts_with('@') {
+                        let ord_str: String = part[1..]
+                            .chars()
+                            .take_while(|c| c.is_ascii_digit())
+                            .collect();
+                        if let Ok(ord) = ord_str.parse::<u16>() {
+                            ordinal = Some(ord);
+                        }
+                    } else if part.eq_ignore_ascii_case("NONAME") {
+                        noname = true;
+                    }
+                }
+
+                exports.push(((*name_part).to_string(), ordinal, noname));
+            }
+        }
+    }
+    exports
+}
+
+struct DllConfig {
+    def_ident: Ident,
+    target_name: Option<LitStr>,
+    custom_path: Option<LitStr>,
+}
+
+impl Parse for DllConfig {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        let content;
+        syn::braced!(content in input);
+
+        let mut def_ident = None;
+        let mut target_name = None;
+        let mut custom_path = None;
+
+        while !content.is_empty() {
+            let key: Ident = content.parse()?;
+            content.parse::<Token![:]>()?;
+
+            if key == "def" {
+                if let Ok(lit) = content.parse::<LitStr>() {
+                    def_ident = Some(syn::parse_str::<Ident>(&lit.value())?);
+                } else {
+                    def_ident = Some(content.parse::<Ident>()?);
+                }
+            } else if key == "target" {
+                target_name = Some(content.parse()?);
+            } else if key == "path" {
+                custom_path = Some(content.parse()?);
+            }
+
+            if content.peek(Token![,]) {
+                content.parse::<Token![,]>()?;
+            }
+        }
+
+        let def_ident = def_ident.ok_or_else(|| {
+            syn::Error::new(
+                content.span(),
+                "Missing required 'def' field in proxy_dll configuration",
+            )
+        })?;
+
+        Ok(DllConfig {
+            def_ident,
+            target_name,
+            custom_path,
+        })
+    }
 }
 
 struct Input {
-    dlls: Punctuated<Ident, Token![,]>,
+    configs: Punctuated<DllConfig, Token![,]>,
     entrypoint: Ident,
 }
 
-impl syn::parse::Parse for Input {
+impl Parse for Input {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
         let content;
         syn::bracketed!(content in input);
-        let dlls = content.parse_terminated(Ident::parse, Token![,])?;
+        let configs = content.parse_terminated(DllConfig::parse, Token![,])?;
+
         input.parse::<Token![,]>()?;
         let entrypoint = input.parse()?;
-        Ok(Input { dlls, entrypoint })
+
+        Ok(Input {
+            configs,
+            entrypoint,
+        })
     }
 }
 
@@ -31,28 +129,38 @@ impl syn::parse::Parse for Input {
 pub fn proxy_dll(input: TokenStream) -> TokenStream {
     let parsed = parse_macro_input!(input as Input);
 
-    let mut targets = vec![];
+    let mut targets_dlls = vec![];
+    let mut custom_paths = vec![];
     let mut export_fns = vec![];
     let mut setup_forwards = vec![];
     let mut forward_counts = vec![];
 
-    for (target_n, target) in parsed.dlls.iter().enumerate() {
-        let dll = format!("{target}.dll");
+    for (target_n, config) in parsed.configs.iter().enumerate() {
+        let def_name = config.def_ident.to_string();
 
-        let file_string =
-            std::fs::read_to_string(format!("{}/defs/{target}.def", env!("CARGO_MANIFEST_DIR")))
-                .unwrap();
-        let file = msvc_def::parse(&strip_comments(&file_string)).unwrap();
+        let dll_filename = match &config.target_name {
+            Some(t) => t.value(),
+            None => format!("{def_name}.dll"),
+        };
 
-        targets.push(quote! {#dll});
+        let path_token = match &config.custom_path {
+            Some(p) => quote! { Some(#p) },
+            None => quote! { None },
+        };
+
+        targets_dlls.push(dll_filename);
+        custom_paths.push(path_token);
+
+        let file_string = std::fs::read_to_string(format!(
+            "{}/defs/{def_name}.def",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+
+        let exports = parse_def_exports(&file_string);
 
         let mut count: usize = 0;
-        for export in file.exports {
-            let name = export.name;
-            if name == "DllMain" {
-                continue;
-            }
-
+        for (name, ordinal, noname) in exports {
             let name_ident = format_ident!("{name}");
 
             export_fns.push(quote! {
@@ -63,20 +171,19 @@ pub fn proxy_dll(input: TokenStream) -> TokenStream {
             });
 
             let cstr_name = std::ffi::CString::new(name).unwrap();
-
-            let name_or_ord = if export.noname {
-                let ord = export.ordinal.unwrap();
-                quote! {
-                    #ord as *const u8
-                }
+            let name_or_ord = if noname {
+                let ord = ordinal.expect("NONAME export requires an ordinal");
+                quote! { #ord as *const u8 }
             } else {
-                quote! {
-                    #cstr_name.as_ptr() as *const u8
-                }
+                quote! { #cstr_name.as_ptr() as *const u8 }
             };
 
             setup_forwards.push(quote! {
-                FORWARDS[#target_n][#count] = GetProcAddress(TARGET_DLL_HANDLES[#target_n], #name_or_ord).unwrap_unchecked() as usize;
+                if let Some(addr) = GetProcAddress(TARGET_DLL_HANDLES[#target_n], #name_or_ord) {
+                    FORWARDS[#target_n][#count] = addr as usize;
+                } else {
+                    ExitProcess(1);
+                }
             });
 
             count += 1;
@@ -85,17 +192,21 @@ pub fn proxy_dll(input: TokenStream) -> TokenStream {
     }
 
     let entrypoint = parsed.entrypoint;
-    let target_count = targets.len();
+    let target_count = parsed.configs.len();
 
     let output = quote! {
         unsafe extern "system" fn __call_entrypoint(_: usize) {
             #entrypoint();
         }
+
         #[cfg(windows)]
         mod __proxy_dll {
-            const TARGETS: &[&str] = &[#(#targets,)*];
-            static mut TARGET_DLL_HANDLES: &mut [HMODULE] = &mut [std::ptr::null_mut(); #target_count];
-            static mut FORWARDS: &mut [&mut [usize]] = &mut [#(&mut [0; #forward_counts],)*];
+            use super::*;
+            const TARGETS: &[&str] = &[#(&#targets_dlls),*];
+            const CUSTOM_PATHS: &[Option<&str>] = &[#(#custom_paths),*];
+
+            static mut TARGET_DLL_HANDLES: [HMODULE; #target_count] = [std::ptr::null_mut(); #target_count];
+            static mut FORWARDS: [&mut [usize]; #target_count] = [#(&mut [0; #forward_counts]),*];
 
             static mut INIT: bool = false;
 
@@ -108,32 +219,39 @@ pub fn proxy_dll(input: TokenStream) -> TokenStream {
                 #(#setup_forwards)*
             }
 
+            use ::proxy_dll::windows_sys::core::BOOL;
             use ::proxy_dll::windows_sys::{
                 Win32::{
-                    Foundation::{FreeLibrary, BOOL, HMODULE, MAX_PATH},
+                    Foundation::{FreeLibrary, HMODULE},
                     System::{
-                        LibraryLoader::{GetProcAddress, LoadLibraryA, LoadLibraryW},
-                        SystemInformation::GetSystemDirectoryW,
+                        LibraryLoader::{GetProcAddress, LoadLibraryW},
                         SystemServices::{DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH},
-                        Threading::{ExitProcess, GetCurrentProcess, GetCurrentThread, QueueUserAPC},
+                        Threading::{ExitProcess, GetCurrentThread, QueueUserAPC},
                     },
                 },
             };
 
             unsafe fn load_targets() {
-                let Ok(dir) = ::proxy_dll::get_system_directory() else {
-                    return;
-                };
+                let system_dir = ::proxy_dll::get_system_directory().ok();
 
                 for (i, target) in TARGETS.iter().enumerate() {
                     use std::os::windows::ffi::OsStrExt;
-                    let mut dll_path = dir.join(target).into_os_string();
+
+                    let base_path = if let Some(path) = CUSTOM_PATHS[i] {
+                        std::path::PathBuf::from(path)
+                    } else if let Some(ref dir) = system_dir {
+                        dir.clone()
+                    } else {
+                        ExitProcess(1);
+                    };
+
+                    let mut dll_path = base_path.join(target).into_os_string();
                     dll_path.push("\0");
 
                     TARGET_DLL_HANDLES[i] = LoadLibraryW(dll_path.encode_wide().collect::<Vec<u16>>().as_ptr());
 
                     if TARGET_DLL_HANDLES[i].is_null() {
-                        ExitProcess(0);
+                        ExitProcess(1);
                     }
                 }
             }
@@ -150,12 +268,14 @@ pub fn proxy_dll(input: TokenStream) -> TokenStream {
                             INIT = true;
                             load_targets();
                             setup_forwards();
-                            QueueUserAPC(Some(super::__call_entrypoint), GetCurrentThread(), 0);
+                            QueueUserAPC(Some(__call_entrypoint), GetCurrentThread(), 0);
                         }
                     },
                     DLL_PROCESS_DETACH => unsafe {
                         for handle in TARGET_DLL_HANDLES.iter() {
-                            FreeLibrary(*handle);
+                            if !handle.is_null() {
+                                FreeLibrary(*handle);
+                            }
                         }
                     },
                     _ => {}
